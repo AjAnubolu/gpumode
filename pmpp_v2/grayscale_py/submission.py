@@ -1,5 +1,5 @@
 #!POPCORN leaderboard grayscale_v2
-#!POPCORN gpu H100
+#!POPCORN gpu B200
 
 from task import input_t, output_t
 import triton
