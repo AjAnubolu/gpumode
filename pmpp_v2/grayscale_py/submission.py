@@ -1,130 +1,128 @@
 #!POPCORN leaderboard grayscale_v2
 #!POPCORN gpu B200
 
+# CUDA float4 vectorized grayscale. Loads/stores 4 pixels at once via float4
+# to saturate HBM bandwidth better than per-scalar Triton loads.
+# For NCHW input: read 4 consecutive values from each of R, G, B planes.
+# Output is a single-channel image.
 from task import input_t, output_t
-import triton
-import triton.language as tl
+import torch
+from torch.utils.cpp_extension import load_inline
 
 
-@triton.jit
-def grayscale_kernel(
-    rgb_ptr,
-    out_ptr,
-    n_pixels,
-    r_stride,   # offset (in elements) between the R and G channel planes
-    BLOCK: tl.constexpr,
-):
-    """One program handles BLOCK output pixels.
+_CUDA_SRC = r"""
+#include <cuda_runtime.h>
+#include <cstdint>
 
-    Layout assumed by caller: R, G, B channels live in separate contiguous
-    planes of length `n_pixels` each, with `r_stride` elements between plane
-    starts. For a contiguous (N, 3, H, W) tensor, r_stride == H*W == n_pixels,
-    and the whole (N, 3, H, W) buffer is laid out as
-    [batch0_R | batch0_G | batch0_B | batch1_R | ...]. We treat the problem as
-    a flat array of n_pixels * N output pixels; each output pixel i pulls
-    R = rgb[i + 0*r_stride], G = rgb[i + 1*r_stride], B = rgb[i + 2*r_stride],
-    but we also need to hop over whole (3*r_stride) spans per batch. The caller
-    flattens this by calling us once per batch (see custom_kernel).
-    """
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_pixels
+// Per-thread: 4 output pixels via float4 loads from each R/G/B plane.
+// plane_stride = H*W (elements between plane starts, in units of dtype).
+// n_pixels_per_batch = H*W.
+// Grid-stride loop; each thread handles multiple float4 chunks of the image.
 
-    r = tl.load(rgb_ptr + 0 * r_stride + offs, mask=mask)
-    g = tl.load(rgb_ptr + 1 * r_stride + offs, mask=mask)
-    b = tl.load(rgb_ptr + 2 * r_stride + offs, mask=mask)
+__global__ void grayscale_f4_nchw(const float* __restrict__ rgb,
+                                   float* __restrict__ out,
+                                   int64_t n_pixels_per_batch,
+                                   int64_t plane_stride,
+                                   int batches) {
+    const int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    // total float4 chunks across all batches (each batch has n_pixels_per_batch / 4 chunks)
+    const int64_t chunks_per_batch = n_pixels_per_batch / 4;
+    const int64_t total_chunks = chunks_per_batch * batches;
 
-    # Cast weights to the input dtype so we don't accidentally upcast.
-    y = r * 0.299 + g * 0.587 + b * 0.114
-    tl.store(out_ptr + offs, y, mask=mask)
+    for (int64_t i = tid; i < total_chunks; i += stride) {
+        int64_t batch = i / chunks_per_batch;
+        int64_t chunk_in_batch = i % chunks_per_batch;
+        int64_t pixel_offset = chunk_in_batch * 4;
+        // base per-batch offset (in elements, not bytes)
+        int64_t batch_offset = batch * plane_stride * 3;
+        const float* r_ptr = rgb + batch_offset + 0 * plane_stride + pixel_offset;
+        const float* g_ptr = rgb + batch_offset + 1 * plane_stride + pixel_offset;
+        const float* b_ptr = rgb + batch_offset + 2 * plane_stride + pixel_offset;
 
+        float4 r = *reinterpret_cast<const float4*>(r_ptr);
+        float4 g = *reinterpret_cast<const float4*>(g_ptr);
+        float4 b = *reinterpret_cast<const float4*>(b_ptr);
+        float4 y;
+        y.x = 0.299f*r.x + 0.587f*g.x + 0.114f*b.x;
+        y.y = 0.299f*r.y + 0.587f*g.y + 0.114f*b.y;
+        y.z = 0.299f*r.z + 0.587f*g.z + 0.114f*b.z;
+        y.w = 0.299f*r.w + 0.587f*g.w + 0.114f*b.w;
 
-@triton.jit
-def grayscale_kernel_hwc(
-    rgb_ptr,
-    out_ptr,
-    n_pixels,
-    BLOCK: tl.constexpr,
-):
-    """Channels-last layout: rgb is flat [R0,G0,B0,R1,G1,B1,...]."""
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_pixels
+        float* o_ptr = out + batch * n_pixels_per_batch + pixel_offset;
+        *reinterpret_cast<float4*>(o_ptr) = y;
+    }
+}
 
-    base = offs * 3
-    r = tl.load(rgb_ptr + base + 0, mask=mask)
-    g = tl.load(rgb_ptr + base + 1, mask=mask)
-    b = tl.load(rgb_ptr + base + 2, mask=mask)
+// Fallback scalar kernel for tail (when n_pixels_per_batch % 4 != 0).
+__global__ void grayscale_tail(const float* rgb, float* out,
+                                int64_t tail_start, int64_t n_pixels_per_batch,
+                                int64_t plane_stride, int batches) {
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    int64_t tail_len = n_pixels_per_batch - tail_start;
+    int64_t total = tail_len * batches;
+    for (int64_t i = tid; i < total; i += stride) {
+        int64_t batch = i / tail_len;
+        int64_t offset = tail_start + (i % tail_len);
+        int64_t batch_offset = batch * plane_stride * 3;
+        float r = rgb[batch_offset + 0 * plane_stride + offset];
+        float g = rgb[batch_offset + 1 * plane_stride + offset];
+        float b = rgb[batch_offset + 2 * plane_stride + offset];
+        out[batch * n_pixels_per_batch + offset] = 0.299f*r + 0.587f*g + 0.114f*b;
+    }
+}
 
-    y = r * 0.299 + g * 0.587 + b * 0.114
-    tl.store(out_ptr + offs, y, mask=mask)
+void launch_grayscale_f4(uintptr_t rgb_ptr, uintptr_t out_ptr,
+                          int64_t n_pixels_per_batch, int64_t plane_stride, int batches) {
+    const int TPB = 256;
+    int64_t chunks_per_batch = n_pixels_per_batch / 4;
+    int64_t total_chunks = chunks_per_batch * batches;
+    int blocks = (int)((total_chunks + TPB - 1) / TPB);
+    if (blocks > 65535) blocks = 65535;  // cap for grid-stride loop
+    grayscale_f4_nchw<<<blocks, TPB>>>(
+        reinterpret_cast<const float*>(rgb_ptr),
+        reinterpret_cast<float*>(out_ptr),
+        n_pixels_per_batch, plane_stride, batches);
+
+    int64_t tail_start = chunks_per_batch * 4;
+    if (tail_start < n_pixels_per_batch) {
+        int64_t tail_len = n_pixels_per_batch - tail_start;
+        int tail_blocks = (int)((tail_len * batches + TPB - 1) / TPB);
+        if (tail_blocks < 1) tail_blocks = 1;
+        grayscale_tail<<<tail_blocks, TPB>>>(
+            reinterpret_cast<const float*>(rgb_ptr),
+            reinterpret_cast<float*>(out_ptr),
+            tail_start, n_pixels_per_batch, plane_stride, batches);
+    }
+}
+"""
+
+_CPP_SRC = "void launch_grayscale_f4(uintptr_t, uintptr_t, int64_t, int64_t, int);"
+
+_mod = load_inline(
+    name="grayscale_f4",
+    cpp_sources=_CPP_SRC,
+    cuda_sources=_CUDA_SRC,
+    functions=["launch_grayscale_f4"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_100"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
 
 
 def custom_kernel(data: input_t) -> output_t:
-    # Defensive unpacking: first element is the RGB input, last is the output
-    # buffer. Works for both (rgb, out) 2-tuples and (rgb, out, spec) 3-tuples.
-    rgb, output = data[0], data[-1]
-
-    BLOCK = 1024
-
-    # Detect layout. Default assumption: PyTorch NCHW = (N, 3, H, W).
+    rgb = data[0]
+    out = data[-1]
+    # Expect (N, 3, H, W) NCHW layout (tests confirm this)
     if rgb.dim() == 4 and rgb.shape[1] == 3:
-        # (N, 3, H, W), channels-first. Iterate over batch; each call does
-        # H*W output pixels. For typical N=1 this is a single launch.
-        N, C, H, W = rgb.shape
-        n_pixels = H * W
-        grid = (triton.cdiv(n_pixels, BLOCK),)
-        # rgb is assumed contiguous; .contiguous() is cheap (no-op) if so.
-        rgb_c = rgb.contiguous()
-        out_c = output  # assume contiguous; popcorn supplies a fresh buffer.
-        # Channel stride in elements between R/G/B planes within one sample.
-        plane = n_pixels
-        sample_stride_in = 3 * plane
-        sample_stride_out = plane
-        for n in range(N):
-            grayscale_kernel[grid](
-                rgb_c[n].view(-1),                # flat view of one (3,H,W) sample
-                out_c.view(-1)[n * sample_stride_out : (n + 1) * sample_stride_out],
-                n_pixels,
-                plane,
-                BLOCK=BLOCK,
-            )
-        return output
-
-    if rgb.dim() == 3 and rgb.shape[0] == 3:
-        # (3, H, W)
-        C, H, W = rgb.shape
-        n_pixels = H * W
-        grid = (triton.cdiv(n_pixels, BLOCK),)
-        rgb_c = rgb.contiguous().view(-1)
-        out_c = output.view(-1)
-        grayscale_kernel[grid](rgb_c, out_c, n_pixels, n_pixels, BLOCK=BLOCK)
-        return output
-
-    if rgb.dim() == 3 and rgb.shape[-1] == 3:
-        # (H, W, 3) channels-last.
-        H, W, C = rgb.shape
-        n_pixels = H * W
-        grid = (triton.cdiv(n_pixels, BLOCK),)
-        rgb_c = rgb.contiguous().view(-1)
-        out_c = output.view(-1)
-        grayscale_kernel_hwc[grid](rgb_c, out_c, n_pixels, BLOCK=BLOCK)
-        return output
-
-    if rgb.dim() == 4 and rgb.shape[-1] == 3:
-        # (N, H, W, 3)
-        N, H, W, C = rgb.shape
-        n_pixels = N * H * W
-        grid = (triton.cdiv(n_pixels, BLOCK),)
-        rgb_c = rgb.contiguous().view(-1)
-        out_c = output.view(-1)
-        grayscale_kernel_hwc[grid](rgb_c, out_c, n_pixels, BLOCK=BLOCK)
-        return output
-
-    # Fallback: assume NCHW-compatible and operate on raw storage.
-    n_pixels = rgb.numel() // 3
-    rgb_c = rgb.contiguous().view(-1)
-    out_c = output.view(-1)
-    grid = (triton.cdiv(n_pixels, BLOCK),)
-    grayscale_kernel[grid](rgb_c, out_c, n_pixels, n_pixels, BLOCK=BLOCK)
-    return output
+        N, _, H, W = rgb.shape
+        n_pixels_per_batch = H * W
+        plane_stride = H * W  # elements between plane starts
+        _mod.launch_grayscale_f4(rgb.data_ptr(), out.data_ptr(),
+                                  n_pixels_per_batch, plane_stride, N)
+    else:
+        # fallback to PyTorch for unusual shapes
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        out.copy_((0.299*r + 0.587*g + 0.114*b).unsqueeze(1))
+    return out
