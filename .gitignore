@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.o
+*.out
+cuda/vector_add
+cuda/matmul_naive
+.venv/
+.modal/
+.ipynb_checkpoints/
