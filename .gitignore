@@ -7,3 +7,6 @@ cuda/matmul_naive
 .venv/
 .modal/
 .ipynb_checkpoints/
+
+# local-only notes, not for publishing
+learning/
