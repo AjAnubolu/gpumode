@@ -1,8 +1,9 @@
 #!POPCORN leaderboard histogram_v2
 #!POPCORN gpu B200
 
-# Privatized histogram with per-warp shared-mem bins + float4 vectorized loads.
-# Kills atomic contention on high-concentration workloads (bot uses contention=10,90).
+# Privatized histogram with per-warp shared-mem bins + float4 loads for fp32.
+# Handles fp32, int32, AND int64 (torch.randint default dtype).
+# Previous int64 fallback to torch.bincount was why bot showed 248us.
 import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
@@ -23,14 +24,12 @@ __global__ void hist_priv_v4(const float* __restrict__ samples,
     int warp_id = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int* warp_bins = smem + warp_id * num_bins;
-
-    // Zero private bins
     for (int i = lane; i < num_bins; i += 32) warp_bins[i] = 0;
     __syncthreads();
 
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int nv = n >> 2;  // n / 4
+    int nv = n >> 2;
     const float4* xv = reinterpret_cast<const float4*>(samples);
 
     for (int i = tid; i < nv; i += stride) {
@@ -48,7 +47,6 @@ __global__ void hist_priv_v4(const float* __restrict__ samples,
         atomicAdd(&warp_bins[b2], 1);
         atomicAdd(&warp_bins[b3], 1);
     }
-
     int tail = nv << 2;
     for (int i = tail + tid; i < n; i += stride) {
         float v = samples[i];
@@ -57,8 +55,6 @@ __global__ void hist_priv_v4(const float* __restrict__ samples,
         atomicAdd(&warp_bins[b], 1);
     }
     __syncthreads();
-
-    // Reduce privatized copies
     for (int i = threadIdx.x; i < num_bins; i += blockDim.x) {
         int sum = 0;
         #pragma unroll
@@ -67,7 +63,8 @@ __global__ void hist_priv_v4(const float* __restrict__ samples,
     }
 }
 
-__global__ void hist_priv_i32(const int32_t* __restrict__ samples,
+template <typename T>
+__global__ void hist_priv_int(const T* __restrict__ samples,
                                int* __restrict__ bins,
                                int n, int num_bins) {
     extern __shared__ int smem[];
@@ -79,7 +76,7 @@ __global__ void hist_priv_i32(const int32_t* __restrict__ samples,
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
     for (int i = tid; i < n; i += stride) {
-        int v = samples[i];
+        int v = (int)samples[i];
         if (v >= 0 && v < num_bins) atomicAdd(&warp_bins[v], 1);
     }
     __syncthreads();
@@ -118,19 +115,33 @@ void launch_hist_i32(uintptr_t samples, uintptr_t bins, int n, int num_bins) {
     if (blocks > 1024) blocks = 1024;
     if (blocks < 1) blocks = 1;
     int shmem = num_bins * WARPS_PER_BLOCK * (int)sizeof(int);
-    hist_priv_i32<<<blocks, BLOCK_THREADS, shmem>>>(
+    hist_priv_int<int32_t><<<blocks, BLOCK_THREADS, shmem>>>(
         reinterpret_cast<const int32_t*>(samples),
+        reinterpret_cast<int*>(bins), n, num_bins);
+}
+
+void launch_hist_i64(uintptr_t samples, uintptr_t bins, int n, int num_bins) {
+    int zblocks = (num_bins + 127) / 128;
+    if (zblocks < 1) zblocks = 1;
+    zero_bins<<<zblocks, 128>>>(reinterpret_cast<int*>(bins), num_bins);
+    int blocks = (n + BLOCK_THREADS - 1) / BLOCK_THREADS;
+    if (blocks > 1024) blocks = 1024;
+    if (blocks < 1) blocks = 1;
+    int shmem = num_bins * WARPS_PER_BLOCK * (int)sizeof(int);
+    hist_priv_int<int64_t><<<blocks, BLOCK_THREADS, shmem>>>(
+        reinterpret_cast<const int64_t*>(samples),
         reinterpret_cast<int*>(bins), n, num_bins);
 }
 """
 _CPP_SRC = """
 void launch_hist_f32(uintptr_t, uintptr_t, int, int, float, float);
 void launch_hist_i32(uintptr_t, uintptr_t, int, int);
+void launch_hist_i64(uintptr_t, uintptr_t, int, int);
 """
 _mod = load_inline(
-    name="hist_priv_vec4_16warps",
+    name="hist_priv_all_dtypes",
     cpp_sources=_CPP_SRC, cuda_sources=_CUDA_SRC,
-    functions=["launch_hist_f32", "launch_hist_i32"],
+    functions=["launch_hist_f32", "launch_hist_i32", "launch_hist_i64"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_100"],
     extra_cflags=["-O3"], verbose=False)
 
@@ -148,6 +159,8 @@ def custom_kernel(data: input_t) -> output_t:
         _mod.launch_hist_f32(samples.data_ptr(), out.data_ptr(), n, bins, 0.0, 1.0)
     elif in_dt == torch.int32:
         _mod.launch_hist_i32(samples.data_ptr(), out.data_ptr(), n, bins)
+    elif in_dt == torch.int64:
+        _mod.launch_hist_i64(samples.data_ptr(), out.data_ptr(), n, bins)
     else:
         if samples.is_floating_point():
             out.copy_(torch.histc(samples, bins=bins, min=0.0, max=1.0).to(out.dtype))
