@@ -71,7 +71,7 @@ def conv2d_tc_kernel(
         w_mask = (offs_k[:, None] < K) & (offs_n[None, :] < C_out)
         w_val = tl.load(w_ptr + w_offs, mask=w_mask, other=0.0)
 
-        acc = tl.dot(x, w_val, acc=acc, input_precision="tf32x3")
+        acc = tl.dot(x, w_val, acc=acc, input_precision="ieee")
 
     y_offs = (n_idx[:, None] * y_sn
               + offs_n[None, :] * y_sc
