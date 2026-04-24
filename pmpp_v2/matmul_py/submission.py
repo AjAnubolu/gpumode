@@ -60,6 +60,10 @@ def _fp8_matmul(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor):
     # Block size choice: 128x128 is NVIDIA recommendation for FP8 on H100/B200.
     # Require divisibility. If shape doesn't divide, raise -> fallback.
     BM, BN, BK = 128, 128, 128
+    # Require at least 2 blocks per axis — single-block scaling is too lossy
+    # (collapses to per-tensor). Below that threshold, cuBLAS is faster anyway.
+    if M < 2 * BM or N < 2 * BN or K < 2 * BK:
+        raise RuntimeError(f"shape {A.shape} x {B.shape} too small for blockwise FP8")
     if M % BM != 0 or N % BN != 0 or K % BK != 0:
         raise RuntimeError(f"shape {A.shape} x {B.shape} not block-aligned")
 
